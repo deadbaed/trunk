@@ -55,12 +55,17 @@ impl HtmlPipeline {
             .target
             .canonicalize()
             .context("failed to get canonical path of target HTML file")?;
-        let target_html_dir = Arc::new(
+        let target_html_dir = if cfg.resolve_paths_from_workdir {
+            println!("using working directory for relative paths in index.html");
+            cfg.working_directory.clone()
+        } else {
+            println!("using parent folder of index.html for relative paths");
             target_html_path
                 .parent()
                 .context("failed to determine parent dir of target HTML file")?
-                .to_owned(),
-        );
+                .to_owned()
+        };
+        let target_html_dir = Arc::new(target_html_dir);
 
         Ok(Self {
             cfg,
