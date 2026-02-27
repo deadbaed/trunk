@@ -451,18 +451,53 @@ async fn download(
         .context("failed creating temporary output file")?;
 
     let client = get_http_client(client_options).await?;
+    let url = app.url(version)?;
 
-    let resp = client
-        .get(app.url(version)?)
-        .send()
-        .await
-        .context("error sending HTTP request")?;
-    ensure!(
-        resp.status().is_success(),
-        "error downloading archive file: {:?}\n{}",
-        resp.status(),
-        app.url(version)?
-    );
+    async fn download_file(
+        client: &reqwest::Client,
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<reqwest::Response> {
+        let resp = client
+            .get(url)
+            .timeout(timeout)
+            .send()
+            .await
+            .context("error sending HTTP request")?;
+
+        if resp.status().is_success() {
+            Ok(resp)
+        } else {
+            Err(anyhow!(
+                "error downloading archive file: {:?}\n{}",
+                resp.status(),
+                url
+            ))
+        }
+    }
+
+    let mut timeout = 1;
+    let mut attempt = 1;
+
+    // If download fail (due to flaky network for example), retry with exponential backoff
+    let resp = loop {
+        match download_file(&client, &url, std::time::Duration::from_secs(timeout)).await {
+            Ok(resp) => break resp,
+            Err(e) => {
+                if attempt == 5 {
+                    return Err(e);
+                } else {
+                    timeout *= 2;
+                    tracing::warn!(
+                        "attempt {attempt} to download file failed, waiting {timeout} seconds before retrying to download {url}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(timeout)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    };
+
     let mut res_bytes = resp.bytes_stream();
     while let Some(chunk_res) = res_bytes.next().await {
         let chunk = chunk_res.context("error reading chunk from download")?;
