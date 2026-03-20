@@ -170,12 +170,15 @@ jobs:
           - hooks
           - initializer
           - leptos
+          - leptos-baseline
+          - leptos-split
           - no-rust
           - node-module
           - proxy
           - seed
           - target-path
           - vanilla
+          - wasm-split
           - webworker
           - webworker-gloo
           - webworker-module
@@ -228,11 +231,58 @@ jobs:
         run: |
           $GITHUB_WORKSPACE/trunk --config=examples/${{ matrix.example }} build
 
+  e2e-split:
+    needs: test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup | Disable rustup self-update
+        run: |
+          rustup set auto-self-update disable
+
+      - name: Setup | Rust
+        run: |
+          rustup toolchain install stable --target wasm32-unknown-unknown
+          rustup default stable
+
+      - name: Setup | Download CLI
+        uses: actions/download-artifact@v8
+        with:
+          name: test-cli-ubuntu-24.04
+
+      - name: Setup | Make executable
+        run: chmod a+x $GITHUB_WORKSPACE/trunk
+
+      - name: Setup | Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tests/e2e/package-lock.json
+
+      - name: Setup | Install E2E dependencies
+        working-directory: tests/e2e
+        run: npm ci
+
+      - name: Setup | Install Playwright browser
+        working-directory: tests/e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Test | Browser E2E | wasm-split examples
+        working-directory: tests/e2e
+        env:
+          TRUNK_CMD: ${{ github.workspace }}/trunk
+        run: npm test
+
   tests:
     runs-on: ubuntu-slim
     needs:
       - test
       - test-examples
+      - e2e-split
     if: always()
     steps:
       - name: Success

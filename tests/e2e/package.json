@@ -1,0 +1,12 @@
+{
+  "name": "trunk-e2e",
+  "private": true,
+  "scripts": {
+    "test": "npm run test:wasm-split && npm run test:leptos-split",
+    "test:wasm-split": "playwright test -c playwright.wasm-split.config.js",
+    "test:leptos-split": "playwright test -c playwright.leptos-split.config.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.53.1"
+  }
+}
