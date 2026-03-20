@@ -81,6 +81,7 @@ tower-http = { version = "0.6", features = ["fs", "trace", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+wasm_split_cli_support = "0.2"
 which = "8"
 zip = "8"
 

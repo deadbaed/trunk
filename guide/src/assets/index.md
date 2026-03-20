@@ -32,6 +32,7 @@ This will typically look like: `<link data-trunk rel="{type}" href="{path}" ..ot
 - `data-weak-refs`: (optional) instruct `wasm-bindgen` to enable [weak references](https://rustwasm.github.io/docs/wasm-bindgen/reference/weak-references.html).
 - `data-typescript`: (optional) instruct `wasm-bindgen` to output Typescript bindings. Defaults to false.
 - `data-bindgen-target`: (optional) specifies the value of the `wasm-bindgen` [flag `--target`](https://rustwasm.github.io/wasm-bindgen/reference/deployment.html) (see link for possible values). Defaults to `no-modules`. The main use-case is to switch to `web` with `data-type="worker"` which reduces backwards [compatibility](https://caniuse.com/mdn-api_worker_worker_ecmascript_modules) but with some [advantages](https://rustwasm.github.io/wasm-bindgen/examples/without-a-bundler.html?highlight=no-modules#using-the-older---target-no-modules).
+- `data-wasm-split`: (optional) enables wasm-split packaging for the main Rust application. This keeps Trunk's standard startup HTML and emits an additional split loader plus auxiliary wasm chunk files. See `examples/wasm-split` and `examples/leptos-split` for end-to-end examples.
 - `data-loader-shim`: (optional) instruct `trunk` to create a loader shim for web workers. Defaults to false.
 - `data-cross-origin`: (optional) the `crossorigin` setting when loading the code & script resources. Defaults to plain `anonymous`.
 - `data-integrity`: (optional) the `integrity` digest type for code & script resources. Defaults to plain `sha384`.

@@ -4,6 +4,7 @@ mod output;
 mod sri;
 mod wasm_bindgen;
 mod wasm_opt;
+mod wasm_split;
 
 pub use output::RustAppOutput;
 
@@ -36,10 +37,14 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tokio::{fs, io::AsyncWriteExt, process::Command, sync::mpsc, task::JoinHandle};
+use tokio::{fs, process::Command, sync::mpsc, task::JoinHandle};
 use tracing::log;
 use wasm_bindgen::{WasmBindgenFeatures, WasmBindgenTarget, find_wasm_bindgen_version};
 use wasm_opt::WasmOptLevel;
+use wasm_split::{
+    WasmSplitManifest, WasmSplitStageOutput, rewrite_loader_paths, rewrite_prefetch_map,
+    split_loader_file_name, split_manifest_file_name, split_wasm_file_name,
+};
 
 /// A Rust application pipeline.
 pub struct RustApp {
@@ -99,6 +104,8 @@ pub struct RustApp {
     import_bindings_name: Option<String>,
     /// The name of the initializer module
     initializer: Option<PathBuf>,
+    /// Enable wasm-split packaging for this app.
+    split: bool,
 }
 
 /// Describes how the rust application is used.
@@ -199,12 +206,26 @@ impl RustApp {
         let name = bin
             .clone()
             .unwrap_or_else(|| manifest.package.name.to_string());
+        let html_split = attrs.contains_key("data-wasm-split");
 
         let loader_shim = attrs.contains_key("data-loader-shim");
         if loader_shim {
             ensure!(
                 app_type == RustAppType::Worker,
                 "Loader shim has no effect when data-type is \"main\"!"
+            );
+        }
+        if html_split {
+            ensure!(
+                app_type == RustAppType::Main,
+                "wasm-split is currently only supported for the main Rust application"
+            );
+        }
+        let split = matches!(app_type, RustAppType::Main) && html_split;
+        if split {
+            ensure!(
+                wasm_bindgen_target == WasmBindgenTarget::Web,
+                "wasm-split currently requires data-bindgen-target=\"web\""
             );
         }
 
@@ -313,6 +334,7 @@ impl RustApp {
             import_bindings_name,
             initializer,
             target_path,
+            split,
         })
     }
 
@@ -335,6 +357,7 @@ impl RustApp {
         let manifest = CargoMetadata::new(&path).await?;
         let name = manifest.package.name.to_string();
         let integrity = IntegrityType::default_unless(cfg.no_sri);
+        let split = false;
 
         Ok(Some(Self {
             id: None,
@@ -363,6 +386,7 @@ impl RustApp {
             import_bindings_name: None,
             initializer: None,
             target_path: None,
+            split,
         }))
     }
 
@@ -380,15 +404,39 @@ impl RustApp {
 
         // run the cargo build
         let wasm = self.cargo_build().await.context("running cargo build")?;
+        let bundle_hash = self.hashed(&wasm).await.context("hashing wasm output")?;
+
+        let split_output = if self.split {
+            Some(
+                self.wasm_split_build(&wasm, bundle_hash.as_deref())
+                    .await
+                    .context("running wasm-split")?,
+            )
+        } else {
+            None
+        };
+
+        let wasm_bindgen_input = split_output
+            .as_ref()
+            .map(|output| output.main_wasm_path.as_path())
+            .unwrap_or(wasm.as_path());
 
         // run wasm-bindgen
         let mut output = self
-            .wasm_bindgen_build(&wasm)
+            .wasm_bindgen_build(wasm_bindgen_input, bundle_hash.as_deref())
             .await
             .context("running wasm-bindgen")?;
 
+        if let Some(split_output) = split_output {
+            output.split_loader_output = Some(split_output.split_loader_output);
+            output.split_manifest_output = Some(split_output.split_manifest_output);
+            output.auxiliary_wasm_outputs = split_output.split_wasm_outputs;
+        }
+
+        let wasm_outputs = output.wasm_outputs();
+
         // (optionally) run wasm-opt
-        self.wasm_opt_build(&output.wasm_output)
+        self.wasm_opt_build(&wasm_outputs)
             .await
             .context("running wasm-opt")?;
 
@@ -540,7 +588,136 @@ impl RustApp {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn wasm_bindgen_build(&mut self, wasm_path: &Path) -> Result<RustAppOutput> {
+    async fn wasm_split_build(
+        &mut self,
+        wasm_path: &Path,
+        bundle_hash: Option<&str>,
+    ) -> Result<WasmSplitStageOutput> {
+        let mode_segment = if self.cfg.release { "release" } else { "debug" };
+        let split_out = self
+            .manifest
+            .metadata
+            .target_directory
+            .join("wasm-split")
+            .join(mode_segment)
+            .join(&self.name)
+            .into_std_path_buf();
+        fs::create_dir_all(&split_out)
+            .await
+            .context("error creating wasm-split output dir")?;
+
+        let main_wasm_path = split_out.join("main.wasm");
+        let target_dir = target_path(&self.cfg.staging_dist, self.target_path.as_deref(), None)
+            .await
+            .context("error creating split target dir")?;
+        let split_loader_name = split_loader_file_name(bundle_hash);
+        let split_manifest_name = split_manifest_file_name(bundle_hash);
+        let split_loader_output =
+            apply_data_target_path(split_loader_name.clone(), &self.target_path);
+        let split_manifest_output =
+            apply_data_target_path(split_manifest_name.clone(), &self.target_path);
+        let entry_js_output = apply_data_target_path(
+            format!("{}.js", self.hashed_wasm_base(bundle_hash)),
+            &self.target_path,
+        );
+        let main_module = format!("./{}", output_file_name(&entry_js_output)?);
+        let link_name = format!("./{split_loader_name}");
+        let wasm_bytes = fs::read(wasm_path)
+            .await
+            .context("error reading wasm file for wasm-split")?;
+
+        let split_out_task = split_out.clone();
+        let main_wasm_path_task = main_wasm_path.clone();
+        let split_result = tokio::task::spawn_blocking(move || {
+            let mut opts = wasm_split_cli_support::Options::new(&wasm_bytes);
+            opts.output_dir = split_out_task.as_path();
+            opts.main_out_path = main_wasm_path_task.as_path();
+            opts.link_name = &link_name;
+            opts.main_module = &main_module;
+            opts.verbose = false;
+            wasm_split_cli_support::transform(opts).map_err(|err| {
+                anyhow!(
+                    "error running wasm-split transform: {err}; ensure the app uses supported split entry points such as #[wasm_split], #[lazy], or #[lazy_route]"
+                )
+            })
+        })
+        .await
+        .context("error awaiting wasm-split task")??;
+
+        let mut chunk_renames = std::collections::HashMap::new();
+        let mut prefetch_renames = std::collections::HashMap::new();
+        let mut split_wasm_outputs = Vec::with_capacity(split_result.split_modules.len());
+        for split_module in &split_result.split_modules {
+            let original_name = output_file_name(split_module)?;
+            let original_stem = output_file_stem(split_module)?;
+            let hashed_name = split_wasm_file_name(split_module, bundle_hash)?;
+            let hashed_output = apply_data_target_path(hashed_name.clone(), &self.target_path);
+            let staged_path = target_dir.join(&hashed_name);
+
+            tracing::debug!("copying {split_module:?} to {}", staged_path.display());
+            fs::copy(split_module, &staged_path)
+                .await
+                .context("error copying wasm-split file to stage dir")?;
+
+            chunk_renames.insert(original_name, hashed_name);
+            prefetch_renames.insert(original_stem, output_file_name(&hashed_output)?);
+            split_wasm_outputs.push(hashed_output);
+        }
+
+        let split_loader_source = fs::read_to_string(split_out.join(&split_loader_name))
+            .await
+            .context("error reading generated wasm-split loader")?;
+        let split_loader_source = rewrite_loader_paths(split_loader_source, &chunk_renames);
+        let split_loader_path_dist = target_dir.join(&split_loader_name);
+
+        self.write_or_minify_js_bytes(
+            split_loader_source.into_bytes(),
+            &split_loader_path_dist,
+            JsModuleType::Module,
+        )
+        .await
+        .context("error writing split loader file to stage dir")?;
+
+        let split_manifest = WasmSplitManifest {
+            loader: output_file_name(&split_loader_output)?,
+            prefetch_map: rewrite_prefetch_map(split_result.prefetch_map, &prefetch_renames)
+                .context("error rewriting split prefetch map")?,
+        };
+        let split_manifest_bytes = if self.cfg.should_minify() {
+            serde_json::to_vec(&split_manifest)
+        } else {
+            serde_json::to_vec_pretty(&split_manifest)
+        }
+        .context("error serializing split manifest")?;
+        let split_manifest_path_dist = target_dir.join(&split_manifest_name);
+
+        fs::write(&split_manifest_path_dist, split_manifest_bytes)
+            .await
+            .context("error writing split manifest file to stage dir")?;
+
+        self.sri
+            .record_file(
+                SriType::ModulePreload,
+                &split_loader_output,
+                SriOptions::default(),
+                &split_loader_path_dist,
+            )
+            .await?;
+
+        Ok(WasmSplitStageOutput {
+            main_wasm_path,
+            split_loader_output,
+            split_manifest_output,
+            split_wasm_outputs,
+        })
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn wasm_bindgen_build(
+        &mut self,
+        wasm_path: &Path,
+        bundle_hash: Option<&str>,
+    ) -> Result<RustAppOutput> {
         let version = find_wasm_bindgen_version(&self.cfg.tools, &self.manifest);
         let ToolInformation {
             path: wasm_bindgen,
@@ -586,6 +763,9 @@ impl RustApp {
         if self.weak_refs {
             args.push("--weak-refs");
         }
+        if self.split {
+            args.push("--keep-lld-exports");
+        }
         if !self.typescript {
             args.push("--no-typescript");
         }
@@ -607,7 +787,7 @@ impl RustApp {
 
         // Copy the generated WASM & JS loader to the dist dir.
         tracing::debug!("copying generated wasm-bindgen artifacts");
-        let hashed_name = self.hashed_wasm_base(wasm_path).await?;
+        let hashed_name = self.hashed_wasm_base(bundle_hash);
         let hashed_wasm_name =
             apply_data_target_path(format!("{hashed_name}_bg.wasm"), &self.target_path);
 
@@ -663,10 +843,6 @@ impl RustApp {
 
         if let Some(ref m) = loader_shim_path {
             tracing::debug!("creating {}", m.display());
-            let mut loader_f = fs::File::create(m)
-                .await
-                .context("error creating loader shim script")?;
-
             let shim = match self.wasm_bindgen_target {
                 WasmBindgenTarget::Web => {
                     format!("import init from './{hashed_js_name}';await init();")
@@ -679,12 +855,11 @@ impl RustApp {
                      \"no-modules\"!"
                 ),
             };
-            loader_f
-                .write_all(shim.as_bytes())
-                .await
-                .context("error writing loader shim script")?;
-            loader_f
-                .flush()
+            let mode = match self.wasm_bindgen_target {
+                WasmBindgenTarget::NoModules => JsModuleType::Global,
+                _ => JsModuleType::Module,
+            };
+            self.write_or_minify_js_bytes(shim.into_bytes(), m, mode)
                 .await
                 .context("error writing loader shim script")?;
         }
@@ -697,9 +872,13 @@ impl RustApp {
                 "recursively copying from '{snippets_dir_src}' to '{}'",
                 snippets_dir_dest.display()
             );
-            copy_dir_recursive(snippets_dir_src, snippets_dir_dest)
+            let snippets = copy_dir_recursive(snippets_dir_src, snippets_dir_dest)
                 .await
-                .context("error copying snippets dir to stage dir")?
+                .context("error copying snippets dir to stage dir")?;
+            self.minify_snippet_outputs(&snippets)
+                .await
+                .context("error minifying snippet JS files in stage dir")?;
+            snippets
         } else {
             HashSet::new()
         };
@@ -763,6 +942,9 @@ impl RustApp {
             cfg: self.cfg.clone(),
             js_output: hashed_js_name,
             wasm_output: hashed_wasm_name,
+            split_loader_output: None,
+            split_manifest_output: None,
+            auxiliary_wasm_outputs: Vec::new(),
             wasm_size,
             r#type: self.app_type,
             cross_origin: self.cross_origin,
@@ -819,19 +1001,17 @@ impl RustApp {
         })
     }
 
-    /// create a cache busting hashed name for the wasm file, if enabled.
-    async fn hashed_wasm_base(&self, wasm: &Path) -> Result<String> {
+    /// Create the cache-busting base name for the main wasm-bindgen outputs.
+    fn hashed_wasm_base(&self, bundle_hash: Option<&str>) -> String {
         // Skip the hashed file name for workers as their file name must be named at runtime.
         // Therefore, workers use the Cargo binary name for file naming.
         if self.app_type == RustAppType::Worker {
-            return Ok(self.name.clone());
+            return self.name.clone();
         }
 
-        Ok(self
-            .hashed(wasm)
-            .await?
+        bundle_hash
             .map(|hashed| format!("{}-{hashed}", self.name))
-            .unwrap_or_else(|| self.name.clone()))
+            .unwrap_or_else(|| self.name.clone())
     }
 
     fn is_relevant_artifact(&self, art: &Artifact) -> bool {
@@ -884,21 +1064,67 @@ impl RustApp {
             .await
             .context("error reading JS loader file")?;
 
-        let write_bytes = match self.cfg.should_minify() {
-            true => minify_js(bytes, mode),
-            false => bytes,
-        };
-
-        fs::write(destination_path, write_bytes)
+        self.write_or_minify_js_bytes(bytes, destination_path, mode)
             .await
             .context("error writing JS loader file to stage dir")?;
 
         Ok(())
     }
 
-    /// Run `wasm-opt` on the `wasm_path` file, in-place.
+    async fn write_or_minify_js_bytes(
+        &self,
+        bytes: Vec<u8>,
+        destination_path: &Path,
+        mode: JsModuleType,
+    ) -> Result<()> {
+        let write_bytes = if self.cfg.should_minify() {
+            minify_js(bytes, mode)
+        } else {
+            bytes
+        };
+
+        fs::write(destination_path, write_bytes)
+            .await
+            .context("error writing JS file to stage dir")?;
+
+        Ok(())
+    }
+
+    async fn minify_snippet_outputs(&self, snippets: &HashSet<PathBuf>) -> Result<()> {
+        if !self.cfg.should_minify() {
+            return Ok(());
+        }
+
+        for snippet in snippets {
+            let Some(mode) = Self::snippet_js_module_type(snippet) else {
+                continue;
+            };
+
+            let bytes = fs::read(snippet)
+                .await
+                .with_context(|| format!("error reading snippet JS file {}", snippet.display()))?;
+            self.write_or_minify_js_bytes(bytes, snippet, mode)
+                .await
+                .with_context(|| {
+                    format!("error minifying snippet JS file {}", snippet.display())
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn snippet_js_module_type(path: &Path) -> Option<JsModuleType> {
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("mjs") => {
+                Some(JsModuleType::Module)
+            }
+            _ => None,
+        }
+    }
+
+    /// Run `wasm-opt` on the generated wasm files, in-place.
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn wasm_opt_build(&self, wasm_name: &str) -> Result<()> {
+    async fn wasm_opt_build(&self, wasm_names: &[String]) -> Result<()> {
         // If not in release mode, we skip calling wasm-opt.
         if !self.cfg.release {
             return Ok(());
@@ -908,6 +1134,21 @@ impl RustApp {
         if self.wasm_opt == WasmOptLevel::Off {
             log::debug!("wasm-opt is turned off");
             return Ok(());
+        }
+
+        let mut wasm_outputs = Vec::with_capacity(wasm_names.len());
+        for wasm_name in wasm_names {
+            let file_name = output_file_name(wasm_name)?;
+            let staged_wasm = self.cfg.staging_dist.join(wasm_name);
+            ensure!(
+                path_exists(&staged_wasm).await?,
+                "expected staged wasm artifact '{}' for '{}' before wasm-opt, but it was missing. This usually means an earlier Rust pipeline step did not emit the file into '{}'.",
+                staged_wasm.display(),
+                wasm_name,
+                self.cfg.staging_dist.display(),
+            );
+
+            wasm_outputs.push((wasm_name.clone(), file_name, staged_wasm));
         }
 
         let version = self.cfg.tools.wasm_opt.as_deref();
@@ -927,41 +1168,42 @@ impl RustApp {
             .metadata
             .target_directory
             .join(wasm_opt_name)
-            .join(mode_segment);
+            .join(mode_segment)
+            .into_std_path_buf();
         fs::create_dir_all(&output)
             .await
             .context("error creating wasm-opt output dir")?;
 
-        // Build up args for calling wasm-opt.
-        let output = output.join(format!("{}_bg.wasm", self.name));
-        let arg_output = format!("--output={output}");
-        let arg_opt_level = format!("-O{}", self.wasm_opt.as_ref());
-        let arg_opt_params = self.wasm_opt_params.as_slice();
-        let target_wasm = self
-            .cfg
-            .staging_dist
-            .join(wasm_name)
-            .to_string_lossy()
-            .to_string();
-        let mut args: Vec<&str> = vec![&arg_output, &arg_opt_level, &target_wasm];
+        for (wasm_name, file_name, staged_wasm) in wasm_outputs {
+            // Build up args for calling wasm-opt.
+            let optimized_output = output.join(&file_name);
+            let arg_output = format!("--output={}", optimized_output.display());
+            let arg_opt_level = format!("-O{}", self.wasm_opt.as_ref());
+            let arg_opt_params = self.wasm_opt_params.as_slice();
+            let target_wasm = staged_wasm.to_string_lossy().to_string();
+            let mut args: Vec<&str> = vec![&arg_output, &arg_opt_level, &target_wasm];
 
-        if self.reference_types {
-            args.push("--enable-reference-types");
+            if self.reference_types {
+                args.push("--enable-reference-types");
+            }
+
+            args.extend(arg_opt_params.iter().map(|s| s.as_str()));
+
+            // Invoke wasm-opt.
+            tracing::debug!("calling wasm-opt for {wasm_name}");
+            common::run_command(wasm_opt_name, &wasm_opt, &args, &self.cfg.working_directory)
+                .await
+                .map_err(|err| check_target_not_found_err(err, wasm_opt_name))?;
+
+            // Copy the generated WASM file to the dist dir.
+            tracing::debug!(
+                "copying generated wasm-opt artifact from '{}' to '{target_wasm}'",
+                optimized_output.display()
+            );
+            fs::copy(&optimized_output, target_wasm)
+                .await
+                .context("error copying (optimized) wasm file to dist dir")?;
         }
-
-        args.extend(arg_opt_params.iter().map(|s| s.as_str()));
-
-        // Invoke wasm-opt.
-        tracing::debug!("calling wasm-opt");
-        common::run_command(wasm_opt_name, &wasm_opt, &args, &self.cfg.working_directory)
-            .await
-            .map_err(|err| check_target_not_found_err(err, wasm_opt_name))?;
-
-        // Copy the generated WASM file to the dist dir.
-        tracing::debug!("copying generated wasm-opt artifact from '{output}' to '{target_wasm}'");
-        fs::copy(output, target_wasm)
-            .await
-            .context("error copying (optimized) wasm file to dist dir")?;
 
         Ok(())
     }
@@ -984,4 +1226,22 @@ impl RustApp {
 
         Ok(())
     }
+}
+
+fn output_file_name(path: impl AsRef<Path>) -> Result<String> {
+    Ok(path
+        .as_ref()
+        .file_name()
+        .context("output path is missing a file name")?
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn output_file_stem(path: impl AsRef<Path>) -> Result<String> {
+    Ok(path
+        .as_ref()
+        .file_stem()
+        .context("output path is missing a file stem")?
+        .to_string_lossy()
+        .into_owned())
 }

@@ -17,6 +17,12 @@ pub struct RustAppOutput {
     pub js_output: String,
     /// The filename of the generated WASM file written to the dist dir.
     pub wasm_output: String,
+    /// The filename of the generated split loader JS file written to the dist dir.
+    pub split_loader_output: Option<String>,
+    /// The filename of the generated split manifest file written to the dist dir.
+    pub split_manifest_output: Option<String>,
+    /// Additional generated WASM chunk files written to the dist dir.
+    pub auxiliary_wasm_outputs: Vec<String>,
     /// The size of the WASM file
     pub wasm_size: u64,
     /// Is this module main or a worker.
@@ -51,6 +57,28 @@ pub fn pattern_evaluate(template: &str, params: &HashMap<String, String>) -> Str
 }
 
 impl RustAppOutput {
+    pub fn wasm_outputs(&self) -> Vec<String> {
+        let mut outputs = Vec::with_capacity(1 + self.auxiliary_wasm_outputs.len());
+        outputs.push(self.wasm_output.clone());
+        outputs.extend(self.auxiliary_wasm_outputs.iter().cloned());
+        outputs
+    }
+
+    fn split_event_detail(&self, base: &str) -> String {
+        match (&self.split_loader_output, &self.split_manifest_output) {
+            (Some(loader), Some(manifest)) => {
+                format!(", wasmSplit: {{ loader: '{base}{loader}', manifest: '{base}{manifest}' }}")
+            }
+            (Some(loader), None) => {
+                format!(", wasmSplit: {{ loader: '{base}{loader}' }}")
+            }
+            (None, Some(manifest)) => {
+                format!(", wasmSplit: {{ manifest: '{base}{manifest}' }}")
+            }
+            (None, None) => String::new(),
+        }
+    }
+
     pub async fn finalize(self, dom: &mut Document) -> anyhow::Result<()> {
         if self.r#type == RustAppType::Worker {
             // Skip the script tag and preload links for workers, and remove the link tag only.
@@ -132,11 +160,12 @@ window.{bindings} = bindings;
         };
 
         let nonce = nonce_attr(&self.cfg.create_nonce);
+        let split_event_detail = self.split_event_detail(base);
 
         // the code to fire the `TrunkApplicationStarted` event
-        let fire = r#"
-dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
-"#;
+        let fire = format!(
+            "\ndispatchEvent(new CustomEvent(\"TrunkApplicationStarted\", {{detail: {{wasm{split_event_detail}}}}}));\n"
+        );
 
         let init_with_object = self.wasm_bindgen_features.init_with_object;
 
